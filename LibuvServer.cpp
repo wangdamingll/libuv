@@ -8,7 +8,6 @@
 #include <uv.h>
 using namespace std;
 
-uv_async_t async;
 uv_rwlock_t rwlock;
 uv_loop_t *listen_loop;
 struct sockaddr_in addr;
@@ -33,6 +32,7 @@ int fds[2] = { 0 };
 
 #define NUM (2)
 uv_loop_t* client_loop[NUM] = { 0 };
+uv_async_t* async[NUM] = {0};
 
 #define DEFAULT_PORT 7000
 #define DEFAULT_BACKLOG 128
@@ -149,18 +149,33 @@ void on_pip_read(uv_stream_t *pip, ssize_t nread, const uv_buf_t *buf) {
 		free(buf->base);
 }
 
+void on_async_cb(uv_async_t* handle) {
+	std::cout << "on_async_cb::on_async_cb_thread_id=[" << uv_thread_self() << "]" << std::endl;
+	//pop from task list and deal it
+}
 
 void client_thread(void *arg) {
 	std::cout << "client_thread::client_thread_id=[" << uv_thread_self() << "]" << std::endl;
 	thread_info_t* thread_info = (thread_info_t *)arg;
-	uv_async_init(thread_info->client_loop, &async, NULL);
 
+#ifdef MULTI_THREAD_PIP_TEST
 	uv_pipe_t* pip_read = (uv_pipe_t*)malloc(sizeof(uv_pipe_t));
 	uv_pipe_init(thread_info->client_loop, pip_read, 0);
 	uv_pipe_open(pip_read, fds[0]);
 	uv_read_start((uv_stream_t*)pip_read, alloc_buffer, on_pip_read);
-	
+#else
+	async[thread_info->thread_index] = (uv_async_t*)malloc(sizeof(uv_async_t));
+	uv_async_init(thread_info->client_loop, async[thread_info->thread_index], on_async_cb);
+#endif
+
 	uv_run(thread_info->client_loop, UV_RUN_DEFAULT);
+
+#ifdef MULTI_THREAD_PIP_TEST
+	uv_close((uv_handle_t *)pip_read, on_close);
+#else
+	uv_close((uv_handle_t*)(async[thread_info->thread_index]), on_close);
+#endif
+
 	uv_loop_close(thread_info->client_loop);
 	free(thread_info->client_loop);
 	free_uv_loop(thread_info->thread_index);
@@ -171,12 +186,18 @@ void timer_fun_cb(uv_timer_t* timer_req) {
 	//add task list and pip write one char size to all client thread or client thread loop of socket registed in.
 	//map<thread_id,list<task*> >
 
+#ifdef MULTI_THREAD_PIP_TEST
 	write_req_t *write_req = (write_req_t*)malloc(sizeof(write_req_t));
 	char* msg = (char*)malloc(2);
 	memset(msg, 0, 2);
 	write_req->buf = uv_buf_init(msg, 2);
 	memcpy(write_req->buf.base, "1", 2);
 	uv_write((uv_write_t*)write_req, (uv_stream_t*)timer_req->data, &write_req->buf, 1, on_pip_write);
+#else
+	for (int i = 0; i < NUM; i++) {
+		uv_async_send(async[i]);
+	}
+#endif
 }
 
 void init_pip(){
@@ -254,6 +275,10 @@ int main() {
 	uv_timer_init(listen_loop, timer_req);
 	timer_req->data = (void*)pip_write;
 	uv_timer_start(timer_req, timer_fun_cb, 2000, 2000);
+#else
+	uv_timer_t* timer_req = (uv_timer_t*)malloc(sizeof(uv_timer_t));
+	uv_timer_init(listen_loop, timer_req);
+	uv_timer_start(timer_req, timer_fun_cb, 2000, 2000);
 #endif
 
 	uv_tcp_t* server = (uv_tcp_t*)malloc(sizeof(uv_tcp_t));
@@ -270,6 +295,8 @@ int main() {
 
 #ifdef MULTI_THREAD_PIP_TEST
 	uv_close((uv_handle_t*)(pip_write), on_close);
+	uv_close((uv_handle_t*)(timer_req), on_close);
+#else
 	uv_close((uv_handle_t*)(timer_req), on_close);
 #endif
 
